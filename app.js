@@ -8,13 +8,17 @@ const queryParser = require('connect-query');
 const crypto = require('crypto');
 const rs = require('crypto-random-string');
 const moment = require('moment');
+const path = require('path');
+const files = require('serve-static');
 const mainsms = require('mainsmsru')(config.smsAPI);
 const middleware = require('./middleware');
+const log = require('./log');
 
 const app = restana();
 
 const serve = files(path.join(__dirname, 'public'));
 const cache = require('http-cache-middleware');
+const policy = require('./policy');
 
 app.use(cache());
 app.use(serve);
@@ -40,13 +44,36 @@ app.post('/reg', async (req, res) => {
         $setOnInsert: {
             password: password,
             stamp: rs({ length: 32 }),
+            active: false,
+            confirm: code,
             created: new Date(),
             updated: new Date()
         }
     }, {
         upsert: true
     });
+
     if (result.upsertedId) {
+        let code = rs({ length: 5 });
+        mainsms.message.send({
+            test: 0,
+            project: 'CRM_project',
+            recipients: data.login,
+            message: 'Ваш проверочный код: ' + code
+        }, async (err, result) => {
+            if (err) {
+                console.log(err);
+                res.send({ code: 'SERVICE_ERROR', err }, 500);
+            } else {
+                await db.data().collection('$_users').updateOne({
+                    login: data.login
+                }, {
+                    $set: {
+                        confirm: code
+                    }
+                })
+            }
+        });
         res.send({ result: true });
     } else {
         res.send({ result: false });
@@ -78,6 +105,33 @@ app.post('/restore', async (req, res) => {
         }
     });
 });
+
+app.post('/confirm', async (req,res) => {
+    let data = req.body;
+    let user = await db.data().collection('$_users').findOne({
+        login: data.login
+    });
+    if (!user) {
+        res.send({ result: false }, 401);
+    }
+    if (user.active === false, user.confirm && user.confirm === data.code) {
+        await db.data().collection('$_users').updateOne({
+            login: data.login
+        }, {
+            $set: {
+                confirm: null,
+                active: true
+            }
+        });
+        res.send({
+            result: true
+        })
+    } else {
+        res.send({
+            result: false
+        })
+    }
+})
 
 app.post('/code', async (req, res) => {
     let data = req.body;
@@ -154,7 +208,7 @@ app.post('/update', async (req, res) => {
     }
 });
 
-app.post('/auth', async (req, res) => {
+app.post('/auth', log.write, async (req, res) => {
     let data = req.body;
     let user = await db.data().collection('$_users').findOne({
         login: data.login
@@ -168,7 +222,7 @@ app.post('/auth', async (req, res) => {
     hash.update(data.password);
     let hashed = hash.digest('hex');
 
-    if (user.password === hashed) {
+    if (user.active && user.password === hashed) {
         let paylod = { stamp: user.stamp };
         let role = await db.data().collection('$_roles').findOne({
             login: data.login
@@ -191,12 +245,12 @@ app.post('/auth', async (req, res) => {
     }
 });
 
-app.post('/list', middleware.isAuth, async(req,res ) => {
+app.post('/objects.get', middleware.isAuth, policy.isRoles, log.write, async(req,res ) => {
     let active = req.body.active || true;
     res.send(await db.data().collection('$_objects').find({ active: active }).toArray());
 });
 
-app.post('/list.update', middleware.isAuth, async(req,res) => {
+app.post('/objects.update', middleware.isAuth, policy.isRoles, log.write, async(req,res) => {
     for(let obj in req.body.objects) {
         await db.data().collection('$_objects').replaceOne({
             _id: new ObjectId(obj._id)
@@ -205,13 +259,13 @@ app.post('/list.update', middleware.isAuth, async(req,res) => {
     res.send({ result: true });
 });
 
-app.post('/list.add', middleware.isAuth, async(req,res) => {
+app.post('/objects.add', middleware.isAuth, policy.isRoles, log.write, async(req,res) => {
     let object = req.body.object;
     await db.data().collection('$_objects').insertOne(object);
     res.send({ result: true });
 });
 
-app.post('/store.:name.:op', middleware.isAuth, async(req,res) => {
+app.post('/store.:name.:op', middleware.isAuth, policy.isRoles, log.write , async(req,res) => {
     let data = req.body.data;
 
     let op = req.params.op;
